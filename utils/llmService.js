@@ -1,4 +1,5 @@
 const OpenAI = require('openai');
+const crypto = require('crypto');
 
 /**
  * LLM Service for RAG System
@@ -8,9 +9,15 @@ const OpenAI = require('openai');
  */
 
 // Initialize OpenAI client with NVIDIA API configuration
+const apiKey = process.env.NVIDIA_API_KEY || process.env.OPENAI_API_KEY;
+if (!apiKey) {
+    console.error('Missing NVIDIA_API_KEY (or OPENAI_API_KEY) in environment');
+}
+
 const openai = new OpenAI({
-    apiKey: process.env.NVIDIA_API_KEY,
+    apiKey,
     baseURL: 'https://integrate.api.nvidia.com/v1',
+    timeout: 20000, // 20 second timeout
 });
 
 // You can use different models - these are available on NVIDIA API
@@ -21,6 +28,24 @@ const MODELS = {
 };
 
 const DEFAULT_MODEL = MODELS.LLAMA_70B; // Use 8B for speed, change to 70B for better answers
+
+// Simple in-memory cache for identical questions
+const answerCache = new Map();
+const CACHE_TTL = 300000; // 5 minutes
+const MAX_CACHE_SIZE = 100;
+
+function getCacheKey(question, context) {
+    const hash = crypto.createHash('md5');
+    hash.update(question + context.substring(0, 500)); // Use first 500 chars of context
+    return hash.digest('hex');
+}
+
+function cleanCache() {
+    if (answerCache.size > MAX_CACHE_SIZE) {
+        const firstKey = answerCache.keys().next().value;
+        answerCache.delete(firstKey);
+    }
+}
 
 /**
  * Generate answer using RAG (Retrieval-Augmented Generation)
@@ -37,7 +62,18 @@ async function generateAnswer(question, context, options = {}) {
             maxTokens = 500,
             // The 'result' object is expected to be passed in options for metadata
             result = {},
+            useCache = true,
         } = options;
+
+        // Check cache first
+        if (useCache) {
+            const cacheKey = getCacheKey(question, context);
+            const cached = answerCache.get(cacheKey);
+            if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+                console.log('Returning cached answer');
+                return cached.answer;
+            }
+        }
 
         console.log(`Generating answer using ${model}...`);
 
@@ -87,6 +123,16 @@ Please provide a clear and accurate answer based only on the context above.`;
 
         const answer = response.choices[0].message.content;
         console.log('Answer generated successfully');
+
+        // Cache the answer
+        if (useCache) {
+            const cacheKey = getCacheKey(question, context);
+            answerCache.set(cacheKey, {
+                answer,
+                timestamp: Date.now()
+            });
+            cleanCache();
+        }
 
         return answer;
 

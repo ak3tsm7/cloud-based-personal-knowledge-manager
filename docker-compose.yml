@@ -1,24 +1,153 @@
-version: '3.8'
-
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: knowledge-manager-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - km-network
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant-knowledge-manager
     ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC API (optional)
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
     restart: unless-stopped
+    networks:
+      - km-network
+
+  embedding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedding
+    container_name: embedding-service
+    ports:
+      - "8001:8001"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./uploads:/app/uploads
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8001/health || exit 1" ]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 180s
+    networks:
+      - km-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  file-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: file-worker-1
+    volumes:
+      - ./uploads:/app/uploads
+    environment:
+      - NODE_ENV=production
+      - WORKER_ID=file-worker-1
+      - WORKER_TYPE=cpu
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=${MONGO_URI}
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_API_URL=http://embedding-service:8001
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      embedding-service:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - km-network
+
+  file-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: file-worker-2
+    volumes:
+      - ./uploads:/app/uploads
+    environment:
+      - NODE_ENV=production
+      - WORKER_ID=file-worker-2
+      - WORKER_TYPE=cpu
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=${MONGO_URI}
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_API_URL=http://embedding-service:8001
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      embedding-service:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - km-network
+
+  rag-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: rag-worker-1
+    command: ["node", "workers/ragWorker.js"]
+    environment:
+      - NODE_ENV=production
+      - WORKER_ID=rag-worker-1
+      - WORKER_TYPE=rag
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MONGO_URI=${MONGO_URI}
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_API_URL=http://embedding-service:8001
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      embedding-service:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - km-network
+
+networks:
+  km-network:
+    driver: bridge
 
 volumes:
+  redis_data:
+    driver: local
   qdrant_storage:
+    driver: local
+  hf_cache:
     driver: local

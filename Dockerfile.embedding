@@ -1,0 +1,46 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# CPU optimization environment variables
+ENV MKL_NUM_THREADS=4
+ENV OMP_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=4
+ENV TOKENIZERS_PARALLELISM=false
+
+# Install Python dependencies
+# CPU version of PyTorch
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install other dependencies with compatible versions
+RUN pip install --no-cache-dir \
+    "transformers==4.40.2" \
+    "FlagEmbedding==1.2.11" \
+    "peft==0.11.1" \
+    fastapi \
+    uvicorn[standard] \
+    pydantic \
+    redis
+
+# Create cache directory for Hugging Face models
+RUN mkdir -p /root/.cache/huggingface
+
+# Copy the embedding service
+COPY embedding_service.py .
+
+# Expose port
+EXPOSE 8001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8001/health || exit 1
+
+# Run the service
+CMD ["python", "embedding_service.py"]

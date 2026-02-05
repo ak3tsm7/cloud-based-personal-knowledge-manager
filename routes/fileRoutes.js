@@ -9,6 +9,7 @@ const { extractText } = require('../utils/textExtractor');
 const { chunkFileText, getChunkingStats } = require('../utils/chunking');
 const { generateChunkEmbeddings, generateAndStoreChunkEmbeddings, generateEmbedding } = require('../utils/embeddingService');
 const qdrantService = require('../utils/qdrantService');
+const queueService = require('../utils/queueService');
 const { authenticateToken } = require('../middlewares/auth');
 
 // Configure multer storage
@@ -28,7 +29,7 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage,
     fileFilter: (req, file, cb) => {
-        const allowedTypes = /pdf|docx|xlsx|pptx|csv|txt|md|jpeg|jpg|png|gif|mp4|avi|mov/;
+        const allowedTypes = /pdf|docx|xlsx|pptx|csv|txt|md|json|yaml|yml|jpeg|jpg|png|gif|mp4|avi|mov/;
         const extname = allowedTypes.test(file.originalname.toLowerCase());
 
         if (extname) {
@@ -40,13 +41,170 @@ const upload = multer({
     limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+async function processUploadSync(req, res, existingFile = null) {
+    const extractedText = await extractText(req.file.path);
+    let chunks = [];
+    let chunkStats = null;
+    let embeddingStats = null;
+    let qdrantIds = [];
+
+    if (extractedText && extractedText.trim().length > 0) {
+        chunks = chunkFileText(extractedText, {
+            filename: req.file.originalname,
+            mimeType: req.file.mimetype
+        });
+        chunkStats = getChunkingStats(chunks);
+    }
+
+    let fileDoc = existingFile;
+    if (!fileDoc) {
+        fileDoc = new File({
+            userId: req.user.userId,
+            fileName: req.file.originalname,
+            fileType: req.file.mimetype,
+            fileUrl: req.file.path,
+            extractedText: extractedText || '',
+            chunks: chunks,
+            summary: '',
+            embedding: [],
+            qdrantIds: [],
+            status: 'COMPLETED',
+        });
+    } else {
+        fileDoc.fileName = req.file.originalname;
+        fileDoc.fileType = req.file.mimetype;
+        fileDoc.fileUrl = req.file.path;
+        fileDoc.extractedText = extractedText || '';
+        fileDoc.chunks = chunks;
+        fileDoc.summary = '';
+        fileDoc.embedding = [];
+        fileDoc.qdrantIds = [];
+        fileDoc.status = 'COMPLETED';
+    }
+
+    await fileDoc.save();
+
+    if (chunks.length > 0) {
+        try {
+            const result = await generateAndStoreChunkEmbeddings(
+                chunks,
+                fileDoc._id.toString(),
+                req.file.originalname,
+                req.user.userId
+            );
+            chunks = result.chunks;
+            qdrantIds = result.qdrantIds;
+            embeddingStats = {
+                total: result.stats.total,
+                successful: result.stats.successful,
+                failed: result.stats.failed,
+                dimensions: qdrantService.VECTOR_SIZE,
+                storedInQdrant: true
+            };
+            fileDoc.qdrantIds = qdrantIds;
+            fileDoc.chunks = chunks;
+            await fileDoc.save();
+        } catch (embeddingError) {
+            console.error('Error generating embeddings:', embeddingError.message);
+            embeddingStats = { error: embeddingError.message };
+        }
+    }
+
+    return res.status(201).json({
+        message: 'File uploaded successfully',
+        mode: 'sync',
+        file: fileDoc,
+        textExtracted: !!extractedText,
+        chunkCount: chunks.length,
+        chunkStats,
+        embeddingStats
+    });
+}
+
 // GET /api/upload - Show upload form (Protected)
 router.get('/upload', authenticateToken, (req, res) => {
     res.render('upload', { user: req.user });
 });
 
-// POST /api/upload - Upload a file (Protected)
+// POST /api/upload - Upload a file (Protected) - ASYNC with SYNC FALLBACK
 router.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        console.log(`📤 Received file: ${req.file.originalname}`);
+
+        // Check if Redis is available for async processing
+        const redisAvailable = await queueService.isRedisAvailable();
+
+        if (redisAvailable) {
+            // ASYNC MODE: Queue for background processing
+            const newFile = new File({
+                userId: req.user.userId,
+                fileName: req.file.originalname,
+                fileType: req.file.mimetype,
+                fileUrl: req.file.path,
+                extractedText: '',
+                chunks: [],
+                summary: '',
+                embedding: [],
+                qdrantIds: [],
+                status: 'QUEUED',
+                totalChunks: 0,
+                chunksProcessed: 0,
+            });
+
+            await newFile.save();
+            console.log(`✓ File saved with ID: ${newFile._id}, status: QUEUED`);
+
+            const jobId = await queueService.enqueueJob({
+                fileId: newFile._id.toString(),
+                filepath: req.file.path,
+                userId: req.user.userId,
+                mimetype: req.file.mimetype,
+                filename: req.file.originalname,
+                priority: 5,
+            });
+
+            if (!jobId) {
+                console.warn('Redis enqueue failed - processing synchronously');
+                return await processUploadSync(req, res, newFile);
+            }
+
+            newFile.jobId = jobId;
+            await newFile.save();
+
+            console.log(`✓ Job ${jobId} queued for file ${newFile._id}`);
+
+            return res.status(202).json({
+                message: 'File upload accepted for processing',
+                mode: 'async',
+                fileId: newFile._id,
+                jobId: jobId,
+                status: 'QUEUED',
+                statusUrl: `/api/files/${newFile._id}/status`,
+                file: {
+                    id: newFile._id,
+                    fileName: newFile.fileName,
+                    fileType: newFile.fileType,
+                    createdAt: newFile.createdAt,
+                },
+            });
+        }
+
+        // SYNC MODE: Redis not available, process immediately
+        console.log('⚠️  Redis unavailable - processing synchronously');
+        return await processUploadSync(req, res);
+
+    } catch (error) {
+        console.error('Upload error:', error);
+        res.status(500).json({ error: 'Failed to upload file', details: error.message });
+    }
+});
+
+// POST /api/upload/sync - Synchronous upload (for backwards compatibility)
+router.post('/upload/sync', authenticateToken, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No file uploaded' });
@@ -76,7 +234,6 @@ router.post('/upload', authenticateToken, upload.single('file'), async (req, res
             console.log(`Created ${chunks.length} chunks (avg size: ${chunkStats.avgChunkSize} chars)`);
         }
 
-        // ✅ CREATE FILE RECORD WITH USER ID
         const newFile = new File({
             userId: req.user.userId,
             fileName: req.file.originalname,
@@ -86,13 +243,13 @@ router.post('/upload', authenticateToken, upload.single('file'), async (req, res
             chunks: chunks,
             summary: '',
             embedding: [],
-            qdrantIds: []
+            qdrantIds: [],
+            status: 'COMPLETED',
         });
 
         await newFile.save();
         console.log(`File saved to MongoDB with ID: ${newFile._id} for user: ${req.user.userId}`);
 
-        // ✅ GENERATE EMBEDDINGS WITH USER CONTEXT
         if (chunks.length > 0) {
             try {
                 console.log('Generating embeddings for chunks and storing in Qdrant...');
@@ -101,7 +258,7 @@ router.post('/upload', authenticateToken, upload.single('file'), async (req, res
                     chunks,
                     newFile._id.toString(),
                     req.file.originalname,
-                    req.user.userId // Pass userId for Qdrant metadata
+                    req.user.userId
                 );
 
                 chunks = result.chunks;
@@ -146,6 +303,67 @@ router.post('/upload', authenticateToken, upload.single('file'), async (req, res
     } catch (error) {
         console.error('Upload error:', error);
         res.status(500).json({ error: 'Failed to upload file' });
+    }
+});
+
+// GET /api/files/:fileId/status - Check file processing status (Protected)
+router.get('/files/:fileId/status', authenticateToken, async (req, res) => {
+    try {
+        const file = await File.findOne({
+            _id: req.params.fileId,
+            userId: req.user.userId,
+        });
+
+        if (!file) {
+            return res.status(404).json({
+                success: false,
+                error: 'File not found',
+            });
+        }
+
+        // Get job status from Redis if still processing
+        let jobStatus = null;
+        if (file.jobId && (file.status === 'QUEUED' || file.status === 'PROCESSING')) {
+            jobStatus = await queueService.getJobStatus(file.jobId);
+        }
+
+        // Calculate progress
+        let progress = 0;
+        if (file.status === 'COMPLETED') {
+            progress = 100;
+        } else if (file.status === 'FAILED') {
+            progress = 0;
+        } else if (jobStatus) {
+            progress = jobStatus.progress || 0;
+        }
+
+        res.json({
+            fileId: file._id,
+            fileName: file.fileName,
+            status: file.status,
+            jobId: file.jobId,
+            progress: progress,
+            totalChunks: file.totalChunks,
+            chunksProcessed: file.chunksProcessed,
+            processingTime: file.processingTime,
+            startedAt: file.startedAt,
+            completedAt: file.completedAt,
+            error: file.error,
+            createdAt: file.createdAt,
+            // Include job queue status if available
+            queueStatus: jobStatus ? {
+                lastHeartbeat: jobStatus.lastHeartbeat,
+                queueProgress: jobStatus.progress,
+            } : null,
+        });
+
+    } catch (error) {
+        console.error('Status check error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get file status',
+            details: error.message,
+        });
     }
 });
 
@@ -392,3 +610,5 @@ router.post('/search', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+
+

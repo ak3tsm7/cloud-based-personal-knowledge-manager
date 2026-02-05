@@ -8,6 +8,37 @@ const rrfService = require('./rrfService');
  * RAG Service with Hybrid Search (BM25 + Vector + RRF)
  */
 
+// Simple in-memory cache for RAG answers
+const answerCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_CACHE_SIZE = 200;
+
+function getCacheKey(parts) {
+    return parts.join('|');
+}
+
+function getCachedAnswer(cacheKey) {
+    const cached = answerCache.get(cacheKey);
+    if (!cached) return null;
+    if (Date.now() - cached.timestamp > CACHE_TTL_MS) {
+        answerCache.delete(cacheKey);
+        return null;
+    }
+    return cached.value;
+}
+
+function setCachedAnswer(cacheKey, value) {
+    answerCache.set(cacheKey, {
+        value,
+        timestamp: Date.now()
+    });
+
+    if (answerCache.size > MAX_CACHE_SIZE) {
+        const firstKey = answerCache.keys().next().value;
+        answerCache.delete(firstKey);
+    }
+}
+
 const DEFAULT_CONFIG = {
     topK: 5,
     minScore: 0.3,
@@ -24,13 +55,47 @@ const DEFAULT_CONFIG = {
  * @param {Object} options - Configuration options
  * @returns {Promise<Object>} - Answer with metadata
  */
-async function answerQuestion(question, options = {}) {
+async function answerQuestion(question, userId, options = {}) {
     try {
         if (!question || typeof question !== 'string' || question.trim().length === 0) {
             throw new Error('Question is required');
         }
 
         const config = { ...DEFAULT_CONFIG, ...options };
+        const cacheKey = getCacheKey([
+            'rag',
+            userId || 'anonymous',
+            config.searchMode,
+            config.topK,
+            config.minScore,
+            question.trim().toLowerCase()
+        ]);
+
+        const cached = getCachedAnswer(cacheKey);
+        if (cached) {
+            return {
+                ...cached,
+                metadata: {
+                    ...cached.metadata,
+                    cacheHit: true
+                }
+            };
+        }
+
+        // Early return if user has no files - skip expensive operations
+        if (options.fileContext && options.fileContext.length === 0) {
+            console.log('No files found for user, skipping RAG pipeline');
+            return {
+                answer: "You haven't uploaded any documents yet. Please upload some files to get started!",
+                sources: [],
+                metadata: {
+                    chunksRetrieved: 0,
+                    searchMode: config.searchMode,
+                    reason: 'no_files'
+                }
+            };
+        }
+
         console.log(`\n=== Hybrid RAG Pipeline Started ===`);
         console.log(`Question: "${question}"`);
         console.log(`Search Mode: ${config.searchMode}`);
@@ -43,7 +108,8 @@ async function answerQuestion(question, options = {}) {
             console.log('\n[Step 1/5] Running BM25 keyword search...');
             const bm25Results = await bm25Service.searchBM25(
                 question,
-                config.topK * 2 // Get more results for better fusion
+                config.topK * 2, // Get more results for better fusion
+                userId // Pass userId to enable early return optimization
             );
             console.log(`✓ BM25 found ${bm25Results.length} results`);
 
@@ -57,7 +123,12 @@ async function answerQuestion(question, options = {}) {
 
             const vectorResults = await qdrantService.searchSimilarChunks(
                 questionEmbedding,
-                config.topK * 2
+                config.topK * 2,
+                {
+                    must: [
+                        { key: "userId", match: { value: userId } }
+                    ]
+                }
             );
             console.log(`✓ Vector search found ${vectorResults.length} results`);
 
@@ -88,7 +159,12 @@ async function answerQuestion(question, options = {}) {
             console.log('\n[Step 2/4] Searching Qdrant...');
             const searchResults = await qdrantService.searchSimilarChunks(
                 questionEmbedding,
-                config.topK
+                config.topK,
+                {
+                    must: [
+                        { key: "userId", match: { value: userId } }
+                    ]
+                }
             );
 
             finalResults = searchResults
@@ -151,12 +227,12 @@ async function answerQuestion(question, options = {}) {
         console.log('✓ Answer generated');
         console.log('\n=== Hybrid RAG Pipeline Completed ===\n');
 
-        return {
+        const result = {
             answer: answer,
-            context: context, // Add the actual context used for generation
+            context: context,
             sources: finalResults.map(chunk => ({
                 fileName: chunk.fileName,
-                score: chunk.vectorScore || chunk.rrfScore || chunk.score, // Prefer vector score for user confidence
+                score: chunk.vectorScore || chunk.rrfScore || chunk.score,
                 text: chunk.text,
                 chunkIndex: chunk.chunkIndex,
                 fileId: chunk.fileId,
@@ -166,7 +242,7 @@ async function answerQuestion(question, options = {}) {
             metadata: {
                 question: question,
                 chunksRetrieved: finalResults.length,
-                chunksUsed: finalResults.length, // Add this for consistency
+                chunksUsed: finalResults.length,
                 contextLength: context.length,
                 uniqueFiles: uniqueFileNames.length,
                 uniqueFileNames: uniqueFileNames,
@@ -174,6 +250,9 @@ async function answerQuestion(question, options = {}) {
                 timestamp: new Date().toISOString(),
             }
         };
+
+        setCachedAnswer(cacheKey, result);
+        return result;
 
     } catch (error) {
         console.error('Error in Hybrid RAG pipeline:', error.message);
@@ -214,6 +293,24 @@ async function answerQuestionForFile(question, fileId, options = {}) {
         console.log(`File ID: ${fileId}`);
 
         const config = { ...DEFAULT_CONFIG, ...options };
+        const cacheKey = getCacheKey([
+            'rag-file',
+            fileId,
+            config.topK,
+            config.minScore,
+            question.trim().toLowerCase()
+        ]);
+
+        const cached = getCachedAnswer(cacheKey);
+        if (cached) {
+            return {
+                ...cached,
+                metadata: {
+                    ...cached.metadata,
+                    cacheHit: true
+                }
+            };
+        }
 
         // For file-specific search, use vector search with filter
         const questionEmbedding = await generateEmbedding(question);
@@ -243,7 +340,7 @@ async function answerQuestionForFile(question, fileId, options = {}) {
         const context = prepareContext(searchResults, config.maxContextLength);
         const answer = await llmService.generateAnswer(question, context);
 
-        return {
+        const result = {
             answer: answer,
             sources: searchResults.map(chunk => ({
                 fileName: chunk.fileName,
@@ -257,6 +354,8 @@ async function answerQuestionForFile(question, fileId, options = {}) {
                 contextLength: context.length,
             }
         };
+        setCachedAnswer(cacheKey, result);
+        return result;
 
     } catch (error) {
         console.error('Error in file-specific RAG:', error.message);

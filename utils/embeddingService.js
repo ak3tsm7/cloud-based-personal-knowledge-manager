@@ -1,253 +1,209 @@
-const OpenAI = require('openai');
 const qdrantService = require('./qdrantService');
 
-/**
- * Embedding Service using NVIDIA's BGE-M3 Model
- * 
- * This service generates text embeddings using NVIDIA's API
- * with the BGE-M3 model for semantic search capabilities.
- * Integrates with Qdrant for vector storage.
- */
+const EMBEDDING_API_URL =
+    process.env.EMBEDDING_API_URL || 'http://embedding-service:8001';
 
-// Initialize OpenAI client with NVIDIA API configuration
-const openai = new OpenAI({
-    apiKey: process.env.NVIDIA_API_KEY,
-    baseURL: 'https://integrate.api.nvidia.com/v1',
-});
+const BATCH_SIZE = 12;
+const EMBEDDING_DIM = 1024;
+const REQUEST_TIMEOUT = 30000; // 30 seconds (increased for Docker service)
+const MAX_RETRIES = 2;
 
-const EMBEDDING_MODEL = 'baai/bge-m3';
-const BATCH_SIZE = 10; // Process embeddings in batches to avoid rate limits
+// Health check cache
+let serviceHealthy = true;
+let lastHealthCheck = 0;
+const HEALTH_CHECK_INTERVAL = 60000; // 1 minute
 
-/**
- * Generate embedding for a single text
- * @param {string} text - Text to generate embedding for
- * @returns {Promise<Array<number>>} - Embedding vector
- */
-async function generateEmbedding(text) {
+// ---------------- Health Check ----------------
+
+async function checkServiceHealth(forceCheck = false) {
+    const now = Date.now();
+
+    // Skip cache if forceCheck is true
+    if (!forceCheck && now - lastHealthCheck < HEALTH_CHECK_INTERVAL) {
+        return serviceHealthy;
+    }
+
     try {
-        if (!text || typeof text !== 'string' || text.trim().length === 0) {
-            console.warn('Empty or invalid text provided for embedding');
+        // Embedding service can be slow on first request, use longer timeout
+        const res = await fetch(`${EMBEDDING_API_URL}/health`, {
+            signal: AbortSignal.timeout(30000) // 30 second timeout for health check
+        });
+
+        serviceHealthy = res.ok;
+        lastHealthCheck = now;
+        return serviceHealthy;
+    } catch (error) {
+        serviceHealthy = false;
+        lastHealthCheck = now;
+        console.warn('Embedding service health check failed:', error.message);
+        return false;
+    }
+}
+
+// Reset health status to allow retry
+function resetHealthStatus() {
+    serviceHealthy = true;
+    lastHealthCheck = 0;
+}
+
+// ---------------- Single Embedding ----------------
+
+async function generateEmbedding(text, retries = MAX_RETRIES) {
+    if (!text || typeof text !== 'string' || !text.trim()) {
+        return null;
+    }
+
+    // Quick health check
+    const healthy = await checkServiceHealth();
+    if (!healthy) {
+        throw new Error('Embedding service is unavailable');
+    }
+
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+        const res = await fetch(`${EMBEDDING_API_URL}/embed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+            signal: controller.signal
+        });
+
+        clearTimeout(timeout);
+
+        if (!res.ok) {
+            throw new Error(`Embedding service error: ${res.statusText}`);
+        }
+
+        const { embedding } = await res.json();
+
+        if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
             return null;
         }
 
-        // Truncate text if too long (BGE-M3 has a token limit)
-        const maxLength = 8000; // Conservative limit
-        const truncatedText = text.length > maxLength
-            ? text.substring(0, maxLength)
-            : text;
-
-        const response = await openai.embeddings.create({
-            input: [truncatedText],
-            model: EMBEDDING_MODEL,
-            encoding_format: 'float',
-            truncate: 'NONE'
-        });
-
-        const embedding = response.data[0].embedding;
-        console.log(`Generated embedding with ${embedding.length} dimensions`);
-
         return embedding;
     } catch (error) {
-        console.error('Error generating embedding:', error.message);
-
-        // Handle rate limiting
-        if (error.status === 429) {
-            console.log('Rate limit hit, waiting 2 seconds before retry...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return generateEmbedding(text); // Retry once
+        if (error.name === 'AbortError') {
+            console.warn('Embedding request timeout');
+            if (retries > 0) {
+                console.log(`Retrying... (${retries} attempts left)`);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                return generateEmbedding(text, retries - 1);
+            }
+            throw new Error('Embedding request timeout after retries');
         }
-
         throw error;
     }
 }
 
-/**
- * Generate embeddings for multiple texts in batches
- * @param {Array<string>} texts - Array of texts to generate embeddings for
- * @returns {Promise<Array<Array<number>>>} - Array of embedding vectors
- */
+// ---------------- Batch Embeddings ----------------
+
 async function generateBatchEmbeddings(texts) {
-    try {
-        if (!Array.isArray(texts) || texts.length === 0) {
-            console.warn('Empty or invalid texts array provided');
-            return [];
-        }
-
-        const embeddings = [];
-
-        // Process in batches to avoid rate limits
-        for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-            const batch = texts.slice(i, i + BATCH_SIZE);
-
-            console.log(`Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(texts.length / BATCH_SIZE)}`);
-
-            // Filter out empty texts
-            const validTexts = batch.filter(text =>
-                text && typeof text === 'string' && text.trim().length > 0
-            );
-
-            if (validTexts.length === 0) {
-                // Add null embeddings for empty texts
-                embeddings.push(...new Array(batch.length).fill(null));
-                continue;
-            }
-
-            // Truncate texts if too long
-            const maxLength = 8000;
-            const truncatedTexts = validTexts.map(text =>
-                text.length > maxLength ? text.substring(0, maxLength) : text
-            );
-
-            try {
-                const response = await openai.embeddings.create({
-                    input: truncatedTexts,
-                    model: EMBEDDING_MODEL,
-                    encoding_format: 'float',
-                    truncate: 'NONE'
-                });
-
-                const batchEmbeddings = response.data.map(item => item.embedding);
-                embeddings.push(...batchEmbeddings);
-
-                console.log(`Generated ${batchEmbeddings.length} embeddings`);
-
-                // Small delay between batches to avoid rate limiting
-                if (i + BATCH_SIZE < texts.length) {
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
-            } catch (error) {
-                console.error(`Error processing batch ${Math.floor(i / BATCH_SIZE) + 1}:`, error.message);
-
-                // Handle rate limiting
-                if (error.status === 429) {
-                    console.log('Rate limit hit, waiting 5 seconds...');
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                    i -= BATCH_SIZE; // Retry this batch
-                    continue;
-                }
-
-                // Add null embeddings for failed batch
-                embeddings.push(...new Array(batch.length).fill(null));
-            }
-        }
-
-        return embeddings;
-    } catch (error) {
-        console.error('Error in batch embedding generation:', error.message);
-        throw error;
+    if (!Array.isArray(texts) || texts.length === 0) {
+        return [];
     }
-}
 
-/**
- * Generate embeddings for document chunks
- * @param {Array<Object>} chunks - Array of chunk objects with text property
- * @returns {Promise<Array<Object>>} - Chunks with embeddings added
- */
-async function generateChunkEmbeddings(chunks) {
-    try {
-        if (!Array.isArray(chunks) || chunks.length === 0) {
-            console.warn('No chunks provided for embedding generation');
-            return chunks;
-        }
+    const results = [];
 
-        console.log(`Generating embeddings for ${chunks.length} chunks...`);
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+        const batch = texts.slice(i, i + BATCH_SIZE);
 
-        // Extract text from chunks
-        const texts = chunks.map(chunk => chunk.text || '');
-
-        // Generate embeddings
-        const embeddings = await generateBatchEmbeddings(texts);
-
-        // Add embeddings to chunks
-        const chunksWithEmbeddings = chunks.map((chunk, index) => ({
-            ...chunk,
-            embedding: embeddings[index]
-        }));
-
-        const successCount = embeddings.filter(e => e !== null).length;
-        console.log(`Successfully generated ${successCount}/${chunks.length} embeddings`);
-
-        return chunksWithEmbeddings;
-    } catch (error) {
-        console.error('Error generating chunk embeddings:', error.message);
-        throw error;
-    }
-}
-
-/**
- * Generate embeddings and store them in Qdrant (without storing in MongoDB)
- * @param {Array<Object>} chunks - Array of chunk objects with text property
- * @param {string} fileId - MongoDB file document ID
- * @param {string} fileName - Original filename
- * @returns {Promise<Object>} - Result with chunks (without embeddings) and Qdrant IDs
- */
-async function generateAndStoreChunkEmbeddings(chunks, fileId, fileName, userId) {
-    try {
-        if (!Array.isArray(chunks) || chunks.length === 0) {
-            console.warn('No chunks provided for embedding generation');
-            return { chunks: chunks, qdrantIds: [] };
-        }
-
-        console.log(`Generating and storing embeddings for ${chunks.length} chunks...`);
-
-        // Generate embeddings
-        const chunksWithEmbeddings = await generateChunkEmbeddings(chunks);
-
-        // Store embeddings in Qdrant
-        const qdrantIds = await qdrantService.storeChunkEmbeddings(
-            chunksWithEmbeddings,
-            fileId,
-            fileName,
-            userId
+        const payload = batch.map(t =>
+            typeof t === 'string' && t.trim() ? t : " "
         );
 
-        // Remove embeddings from chunks before returning (to avoid MongoDB storage)
-        const chunksWithoutEmbeddings = chunksWithEmbeddings.map(chunk => {
-            const { embedding, ...chunkWithoutEmbedding } = chunk;
-            return chunkWithoutEmbedding;
-        });
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT * 2); // Longer timeout for batch
 
-        const successCount = qdrantIds.length;
-        console.log(`Successfully stored ${successCount}/${chunks.length} embeddings in Qdrant`);
+            const res = await fetch(`${EMBEDDING_API_URL}/embed/batch`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ texts: payload }),
+                signal: controller.signal
+            });
 
-        return {
-            chunks: chunksWithoutEmbeddings,
-            qdrantIds: qdrantIds,
-            stats: {
-                total: chunks.length,
-                successful: successCount,
-                failed: chunks.length - successCount,
+            clearTimeout(timeout);
+
+            if (!res.ok) {
+                throw new Error(res.statusText);
             }
-        };
-    } catch (error) {
-        console.error('Error generating and storing chunk embeddings:', error.message);
-        throw error;
+
+            const { embeddings } = await res.json();
+
+            for (let j = 0; j < batch.length; j++) {
+                const vec = embeddings[j];
+                if (Array.isArray(vec) && vec.length === EMBEDDING_DIM) {
+                    results.push(vec);
+                } else {
+                    results.push(null);
+                }
+            }
+        } catch (err) {
+            console.error('Embedding batch failed:', err.message);
+            results.push(...new Array(batch.length).fill(null));
+        }
     }
+
+    return results;
 }
 
-/**
- * Calculate cosine similarity between two embeddings
- * @param {Array<number>} embedding1 - First embedding vector
- * @param {Array<number>} embedding2 - Second embedding vector
- * @returns {number} - Cosine similarity score (0-1)
- */
-function cosineSimilarity(embedding1, embedding2) {
-    if (!embedding1 || !embedding2 || embedding1.length !== embedding2.length) {
-        return 0;
+// ---------------- Chunk Embeddings ----------------
+
+async function generateChunkEmbeddings(chunks) {
+    if (!Array.isArray(chunks) || chunks.length === 0) return chunks;
+
+    const texts = chunks.map(c => c.text || '');
+    const embeddings = await generateBatchEmbeddings(texts);
+
+    return chunks.map((chunk, i) => ({
+        ...chunk,
+        embedding: embeddings[i]
+    }));
+}
+
+// ---------------- Store in Qdrant ----------------
+
+async function generateAndStoreChunkEmbeddings(chunks, fileId, fileName, userId) {
+    const enriched = await generateChunkEmbeddings(chunks);
+
+    const total = enriched.length;
+    const successful = enriched.filter(c =>
+        Array.isArray(c.embedding) && c.embedding.length === EMBEDDING_DIM
+    ).length;
+    const failed = total - successful;
+
+    const qdrantIds = await qdrantService.storeChunkEmbeddings(
+        enriched,
+        fileId,
+        fileName,
+        userId
+    );
+
+    return {
+        chunks: enriched.map(({ embedding, ...rest }) => rest),
+        qdrantIds,
+        stats: {
+            total,
+            successful,
+            failed
+        }
+    };
+}
+
+// ---------------- Cosine Similarity ----------------
+
+function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] ** 2;
+        nb += b[i] ** 2;
     }
-
-    let dotProduct = 0;
-    let norm1 = 0;
-    let norm2 = 0;
-
-    for (let i = 0; i < embedding1.length; i++) {
-        dotProduct += embedding1[i] * embedding2[i];
-        norm1 += embedding1[i] * embedding1[i];
-        norm2 += embedding2[i] * embedding2[i];
-    }
-
-    const magnitude = Math.sqrt(norm1) * Math.sqrt(norm2);
-    return magnitude === 0 ? 0 : dotProduct / magnitude;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
 module.exports = {
@@ -255,5 +211,7 @@ module.exports = {
     generateBatchEmbeddings,
     generateChunkEmbeddings,
     generateAndStoreChunkEmbeddings,
-    cosineSimilarity
+    cosineSimilarity,
+    checkServiceHealth,
+    resetHealthStatus
 };
